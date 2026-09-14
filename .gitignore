@@ -1,0 +1,22 @@
+# Python runtime and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded local models (restored separately)
+models/
+
+# Runtime artifacts
+logs/
+output/
+voice/temp/
+
+# Local document inspection artifacts
+.codex_doc_review/
+
+# Editor / operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
