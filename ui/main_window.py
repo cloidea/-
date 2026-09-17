@@ -137,6 +137,13 @@ class MainWindow(ctk.CTk):
             command=lambda: self._generate_video(publish_after=True),
         )
         self.publish_button.pack(side="left", padx=10)
+        self.publish_existing_button = ctk.CTkButton(
+            button_frame,
+            text="发布已有视频",
+            width=150,
+            command=self._publish_existing_video,
+        )
+        self.publish_existing_button.pack(side="left", padx=10)
 
         self.media_status_var = ctk.StringVar(value="实际配音时长：--\n模板视频：--\n状态：等待生成")
         self.media_status_label = ctk.CTkLabel(self, textvariable=self.media_status_var, anchor="w", justify="left")
@@ -378,6 +385,7 @@ class MainWindow(ctk.CTk):
         self.after(0, lambda: self.preview_button.configure(state=state))
         self.after(0, lambda: self.generate_button.configure(state=state))
         self.after(0, lambda: self.publish_button.configure(state=state))
+        self.after(0, lambda: self.publish_existing_button.configure(state=state))
         self.after(0, lambda: self.select_button.configure(state=state))
         self.after(0, lambda: self.subtitle_checkbox.configure(state=state))
         self.after(0, lambda: self.douyin_checkbox.configure(state=state))
@@ -415,6 +423,64 @@ class MainWindow(ctk.CTk):
         if not platforms:
             raise ValueError("请至少选择一个发布平台。")
         return title, tags, platforms
+
+    def _prepare_publish(
+        self,
+        video: str | Path,
+        stamp: str,
+        publish_fields: tuple[str, str, list[str]],
+    ) -> None:
+        title, tags, platforms = publish_fields
+        self._set_status("正在准备发布文件和打开上传页面…")
+        package = self.publisher.prepare(
+            video,
+            self.output_dir,
+            stamp,
+            title,
+            tags,
+            platforms,
+        )
+        self._copy_to_clipboard(package.caption)
+        self.publisher.reveal_video(package.video_path)
+        self.publisher.open_upload_pages(platforms)
+        self._set_status("发布页面已打开，标题和标签已复制")
+        platform_names = "、".join(
+            "抖音" if item == "douyin" else "小红书" for item in platforms
+        )
+        self.after(
+            0,
+            lambda: messagebox.showinfo(
+                "发布助手已准备完成",
+                f"已打开：{platform_names}\n"
+                "已在资源管理器中选中视频，并复制标题和标签。\n\n"
+                "请把视频拖入上传页面，粘贴文案，检查后点击发布。",
+            ),
+        )
+
+    def _publish_existing_video(self) -> None:
+        if self.busy:
+            return
+        try:
+            publish_fields = self._publish_fields()
+        except Exception as exc:
+            messagebox.showerror("无法准备发布", str(exc))
+            return
+        path = filedialog.askopenfilename(
+            title="选择已经制作好的视频",
+            initialdir=str(self.output_dir),
+            filetypes=[
+                ("视频文件", "*.mp4 *.mov *.mkv *.webm"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        def action() -> None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._prepare_publish(path, stamp, publish_fields)
+
+        self._run_worker(action)
 
     def _run_worker(self, action) -> None:
         if self.busy:
@@ -493,32 +559,7 @@ class MainWindow(ctk.CTk):
             )
             self._set_status(f"生成完成：{detail}")
             if publish_fields is not None:
-                title, tags, platforms = publish_fields
-                self._set_status("正在准备发布文件和打开上传页面…")
-                package = self.publisher.prepare(
-                    output,
-                    self.output_dir,
-                    stamp,
-                    title,
-                    tags,
-                    platforms,
-                )
-                self._copy_to_clipboard(package.caption)
-                self.publisher.reveal_video(package.video_path)
-                self.publisher.open_upload_pages(platforms)
-                self._set_status("发布页面已打开，标题和标签已复制")
-                platform_names = "、".join(
-                    "抖音" if item == "douyin" else "小红书" for item in platforms
-                )
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "发布助手已准备完成",
-                        f"已打开：{platform_names}\n"
-                        "已在资源管理器中选中视频，并复制标题和标签。\n\n"
-                        "请把视频拖入上传页面，粘贴文案，检查后点击发布。",
-                    ),
-                )
+                self._prepare_publish(output, stamp, publish_fields)
                 return
             self.after(
                 0,
@@ -536,3 +577,4 @@ class MainWindow(ctk.CTk):
         if process is not None and process.poll() is None:
             process.terminate()
         self.destroy()
+

@@ -63,7 +63,10 @@ class PublishAssistant:
 
         package_dir = Path(output_root).resolve() / "publish" / stamp
         package_dir.mkdir(parents=True, exist_ok=True)
-        video = package_dir / "视频.mp4"
+        # Keep the real container extension for an existing finished video.
+        # Renaming a MOV/MKV file to .mp4 without transcoding would produce a
+        # misleading and sometimes un-uploadable file.
+        video = package_dir / f"视频{source.suffix.lower()}"
         shutil.copy2(source, video)
 
         caption = compose_caption(title, hashtags)
@@ -106,3 +109,4 @@ class PublishAssistant:
             ["explorer.exe", f"/select,{video}"],
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
