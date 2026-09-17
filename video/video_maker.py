@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from .ffmpeg_utils import duration_seconds, resolve_executable, run_checked
+from .reliability import require_space, validate_wav
 
 
 def _filter_path(path: Path) -> str:
@@ -51,6 +53,11 @@ class VideoMaker:
         output_duration = audio_duration
         loops = max(1, math.ceil(output_duration / video_duration))
         output.parent.mkdir(parents=True, exist_ok=True)
+        validate_wav(audio)
+        require_space(output.parent, max(256 * 1024**2, int(video.stat().st_size * loops * 2)))
+        if output.exists():
+            raise FileExistsError("输出文件已存在，已保留原文件，请换一个输出名称。")
+        temporary = output.with_name(output.stem + "." + uuid.uuid4().hex[:8] + ".partial.mp4")
         ffmpeg = resolve_executable("ffmpeg", self.ffmpeg_path)
         command = [
                 str(ffmpeg),
@@ -62,11 +69,13 @@ class VideoMaker:
                 "-i",
                 str(audio),
         ]
+        filters = ["pad=ceil(iw/2)*2:ceil(ih/2)*2"]
         if subtitle_path is not None:
             subtitle = Path(subtitle_path).resolve()
             if not subtitle.is_file():
                 raise FileNotFoundError(f"字幕文件不存在：{subtitle}")
-            command.extend(["-vf", f"ass=filename='{_filter_path(subtitle)}'"])
+            filters.append(f"ass=filename='{_filter_path(subtitle)}'")
+        command.extend(["-vf", ",".join(filters)])
         command.extend(
             [
                 "-map",
@@ -89,8 +98,15 @@ class VideoMaker:
                 "0",
                 "-map_chapters",
                 "-1",
-                str(output),
+                str(temporary),
             ]
         )
-        run_checked(command)
-        return VideoResult(str(output), video_duration, audio_duration, output_duration, loops)
+        try:
+            run_checked(command)
+            actual = duration_seconds(temporary, self.ffprobe_path)
+            if abs(actual - audio_duration) > 0.15:
+                raise RuntimeError("成片时长与配音不一致，已保留配音，请重试合成。")
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return VideoResult(str(output), video_duration, audio_duration, actual, loops)

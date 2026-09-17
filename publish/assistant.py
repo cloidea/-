@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import webbrowser
@@ -17,7 +18,7 @@ PLATFORM_URLS = {
 
 
 def normalize_hashtags(value: str) -> str:
-    parts = value.replace("，", " ").replace(",", " ").split()
+    parts = re.split(r"[\s#＃,，]+", value)
     normalized: list[str] = []
     for part in parts:
         tag = part.strip().lstrip("#").strip()
@@ -62,7 +63,12 @@ class PublishAssistant:
             raise ValueError(f"不支持的发布平台：{', '.join(unknown)}")
 
         package_dir = Path(output_root).resolve() / "publish" / stamp
-        package_dir.mkdir(parents=True, exist_ok=True)
+        original_dir = package_dir
+        sequence = 1
+        while package_dir.exists():
+            package_dir = original_dir.with_name(f"{stamp}_{sequence}")
+            sequence += 1
+        package_dir.mkdir(parents=True, exist_ok=False)
         # Keep the real container extension for an existing finished video.
         # Renaming a MOV/MKV file to .mp4 without transcoding would produce a
         # misleading and sometimes un-uploadable file.
@@ -109,4 +115,3 @@ class PublishAssistant:
             ["explorer.exe", f"/select,{video}"],
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-

@@ -29,7 +29,10 @@ class KnownTextCTCAligner(AlignmentProvider):
         root = self._path(str(self.config["gpt_sovits_root"]))
         return root / "runtime" / "python.exe"
 
-    def align(self, audio_path: str | Path, known_text: str) -> list[TimedToken]:
+    def preflight(self, known_text: str) -> None:
+        self.align(self._path(str(self.config["reference_audio"])), known_text, preflight=True)
+
+    def align(self, audio_path: str | Path, known_text: str, preflight: bool = False) -> list[TimedToken]:
         audio = Path(audio_path).resolve()
         if not audio.is_file():
             raise AlignmentError(f"待对齐音频不存在：{audio}")
@@ -55,6 +58,7 @@ class KnownTextCTCAligner(AlignmentProvider):
             "model_dir": str(model_dir),
             "device": str(self.config.get("alignment_device", "cuda")),
             "local_files_only": True,
+            "preflight": preflight,
         }
         request_file: Path | None = None
         response_file: Path | None = None
@@ -82,6 +86,7 @@ class KnownTextCTCAligner(AlignmentProvider):
                 encoding="utf-8",
                 errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=180 if preflight else 600,
             )
             if result.returncode != 0:
                 detail = result.stderr.strip() or result.stdout.strip()
@@ -91,6 +96,8 @@ class KnownTextCTCAligner(AlignmentProvider):
                     )
                 raise AlignmentError(f"字幕强制对齐失败：\n{detail}")
             data = json.loads(response_file.read_text(encoding="utf-8"))
+            if preflight:
+                return []
             tokens = [
                 TimedToken(
                     str(x["text"]),

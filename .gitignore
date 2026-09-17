@@ -10,6 +10,7 @@ models/
 logs/
 output/
 voice/temp/
+browser_profiles/
 
 # Local video templates (keep code-only Git history)
 assets/videos/*.mp4

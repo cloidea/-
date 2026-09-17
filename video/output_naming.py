@@ -23,4 +23,3 @@ def build_video_filename(
     moment = generated_at or datetime.now()
     summary = _filename_summary(publish_title or text)
     return f"胖猫成片_{moment:%Y%m%d_%H%M%S}_{summary}.mp4"
-

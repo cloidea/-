@@ -4,6 +4,8 @@ import os
 import json
 import subprocess
 import threading
+import logging
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,11 +14,13 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 
-from publish.assistant import PublishAssistant
+from publish.assistant import PublishAssistant, compose_caption
+from video.reliability import require_space, validate_wav, voice_cache_key
+from publish.browser_uploader import BrowserUploadService, UploadControl, UploadCancelled
 from tts.gpt_sovits import GPTSoVITSProvider
 from subtitles.pipeline import SubtitlePipeline
 from ui.duration_estimator import count_speakable_characters, estimate_duration_range
-from video.ffmpeg_utils import duration_seconds, resolve_executable, run_checked
+from video.ffmpeg_utils import duration_seconds, probe, resolve_executable, run_checked
 from video.output_naming import build_video_filename
 from video.video_maker import VideoMaker
 
@@ -44,6 +48,10 @@ class MainWindow(ctk.CTk):
         self.video_maker = VideoMaker(self.project_root / "config.json")
         self.subtitle_pipeline = SubtitlePipeline(self.project_root / "config.json")
         self.publisher = PublishAssistant(self.video_maker.ffmpeg_path)
+        self.browser_uploader = BrowserUploadService(self.project_root / "browser_profiles")
+        self.upload_control: UploadControl | None = None
+        self.pending_upload = None
+        self.force_voice = False
         self.tts_process: subprocess.Popen[bytes] | None = None
         self.service_lock = threading.Lock()
         self.busy = False
@@ -53,109 +61,96 @@ class MainWindow(ctk.CTk):
         self.selected_template: VideoTemplate | None = None
         self.speech_chars_per_second = self._load_historical_speech_rate()
 
-        self.title("猫咪沙雕短视频生成器")
-        self.geometry("980x900")
-        self.minsize(820, 780)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        ctk.set_appearance_mode("system")
+        self.selected_publish_video = None
+        self.latest_result = None
+        from ui.layout import build
+        build(self)
 
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+    def _open_generate_publish(self):
+        if self.busy:
+            return
+        dialog = getattr(self, "publish_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift()
+            return
+        from ui.publish_dialog import PublishDialog
+        self.publish_dialog = PublishDialog(self)
 
-        title = ctk.CTkLabel(self, text="猫咪沙雕短视频生成器", font=ctk.CTkFont(size=25, weight="bold"))
-        title.grid(row=0, column=0, columnspan=3, padx=28, pady=(24, 22))
+    def _switch_page(self, page):
+        self.navigation.set(page)
+        self.make_page.grid_remove()
+        self.publish_page.grid_remove()
+        (self.make_page if page == "制作视频" else self.publish_page).grid()
+        if page == "制作视频":
+            self.make_actions.grid()
+        else:
+            self.make_actions.grid_remove()
 
-        ctk.CTkLabel(self, text="视频模板：").grid(row=1, column=0, padx=(28, 10), pady=8, sticky="nw")
-        self.template_frame = ctk.CTkFrame(self)
-        self.template_frame.grid(row=1, column=1, columnspan=2, padx=(0, 28), pady=8, sticky="ew")
-        self.video_var = ctk.StringVar(value="")
-        self._build_template_picker()
+    def _toggle_options(self):
+        if self.options_frame.winfo_manager():
+            self.options_frame.grid_remove()
+        else:
+            self.options_frame.grid()
 
-        self.template_info_var = ctk.StringVar(value="当前选择：暂无可用模板")
-        self.template_info_label = ctk.CTkLabel(self, textvariable=self.template_info_var, anchor="w")
-        self.template_info_label.grid(row=2, column=1, padx=0, pady=(2, 8), sticky="w")
-        if self.selected_template is not None:
-            self.template_info_var.set(
-                f"当前选择：{self.selected_template.name}    "
-                f"视频长度：{self.selected_template.duration:.2f}秒"
-            )
-        self.select_button = ctk.CTkButton(self, text="选择其他本地视频", width=150, command=self._select_video)
-        self.select_button.grid(row=2, column=2, padx=(10, 28), pady=(2, 8), sticky="e")
+    def _toggle_templates(self):
+        if self.template_tools.winfo_manager():
+            self.template_tools.grid_remove()
+        else:
+            self.template_tools.grid()
 
-        ctk.CTkLabel(self, text="文案：").grid(row=3, column=0, padx=(28, 10), pady=8, sticky="nw")
-        self.textbox = ctk.CTkTextbox(self, height=180)
-        self.textbox.grid(row=3, column=1, columnspan=2, padx=(0, 28), pady=8, sticky="nsew")
-        text_file = self.project_root / "文案.txt"
-        if text_file.is_file():
-            self.textbox.insert("1.0", text_file.read_text(encoding="utf-8-sig").strip())
-        self.textbox.bind("<KeyRelease>", self._update_duration_estimate)
-        self.textbox.bind("<<Paste>>", lambda _event: self.after(10, self._update_duration_estimate))
+    def _sync_context_actions(self):
+        for button, column in ((self.resume_upload_button, 1), (self.cancel_upload_button, 2)):
+            if button.cget("state") == "normal":
+                button.grid(row=1, column=column, padx=(0, 20), pady=(0, 10))
+            else:
+                button.grid_remove()
 
-        self.estimate_var = ctk.StringVar(value="预计配音时长：请输入文案")
-        self.estimate_label = ctk.CTkLabel(self, textvariable=self.estimate_var, anchor="w")
-        self.estimate_label.grid(row=4, column=1, columnspan=2, padx=0, pady=(0, 5), sticky="w")
-        self._update_duration_estimate()
+    def _set_publish_video(self, path):
+        path = Path(path).resolve()
+        metadata = probe(path, self.video_maker.ffprobe_path)
+        if not any(item.get("codec_type") == "video" for item in metadata.get("streams", [])):
+            raise ValueError("请选择包含画面的成片视频。")
+        self.selected_publish_video = path
+        self.publish_video_var.set(f"{path.name}\n{float(metadata['format']['duration']):.2f} 秒 · 视频已就绪")
 
-        ctk.CTkLabel(self, text="发布标题：").grid(row=5, column=0, padx=(28, 10), pady=6, sticky="w")
-        self.publish_title_entry = ctk.CTkEntry(self, placeholder_text="例如：猫咪冷知识，最后一句绷不住了")
-        self.publish_title_entry.grid(row=5, column=1, columnspan=2, padx=(0, 28), pady=6, sticky="ew")
+    def _choose_publish_video(self):
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(title="选择成片", initialdir=str(self.output_dir),
+            filetypes=[("视频", "*.mp4 *.mov *.mkv *.webm")])
+        if path:
+            try:
+                self._set_publish_video(path)
+            except Exception as exc:
+                messagebox.showerror("视频不可用", str(exc))
 
-        ctk.CTkLabel(self, text="发布标签：").grid(row=6, column=0, padx=(28, 10), pady=6, sticky="w")
-        self.publish_tags_entry = ctk.CTkEntry(self, placeholder_text="#猫咪 #搞笑 #沙雕配音")
-        self.publish_tags_entry.grid(row=6, column=1, columnspan=2, padx=(0, 28), pady=6, sticky="ew")
+    def _upload_selected(self):
+        if self.busy:
+            return
+        try:
+            fields = self._publish_fields()
+            video = self.selected_publish_video
+            if video is None or not video.is_file():
+                raise ValueError("请先选择需要上传的成片。")
+        except Exception as exc:
+            messagebox.showinfo("还需要一步", str(exc))
+            return
+        self._run_worker(lambda: self._prepare_publish(video, "", fields), error_title="上传失败")
 
-        ctk.CTkLabel(self, text="发布平台：").grid(row=7, column=0, padx=(28, 10), pady=6, sticky="w")
-        platform_frame = ctk.CTkFrame(self, fg_color="transparent")
-        platform_frame.grid(row=7, column=1, columnspan=2, padx=0, pady=6, sticky="w")
-        self.douyin_var = ctk.BooleanVar(value=True)
-        self.xiaohongshu_var = ctk.BooleanVar(value=False)
-        self.douyin_checkbox = ctk.CTkCheckBox(platform_frame, text="抖音", variable=self.douyin_var)
-        self.douyin_checkbox.pack(side="left", padx=(0, 24))
-        self.xiaohongshu_checkbox = ctk.CTkCheckBox(
-            platform_frame, text="小红书", variable=self.xiaohongshu_var
-        )
-        self.xiaohongshu_checkbox.pack(side="left")
+    def _show_result(self, output):
+        self.latest_result = Path(output)
+        self.result_var.set(f"生成完成\n{self.latest_result.name}")
+        self.result_frame.grid()
+        self._set_publish_video(output)
 
-        ctk.CTkLabel(self, text="音色：").grid(row=8, column=0, padx=(28, 10), pady=8, sticky="w")
-        ctk.CTkLabel(self, text="胖猫（固定）", anchor="w").grid(row=8, column=1, columnspan=2, padx=0, pady=8, sticky="w")
+    def _open_result(self):
+        if self.latest_result and self.latest_result.is_file():
+            os.startfile(self.latest_result)
 
-        self.subtitle_var = ctk.BooleanVar(value=True)
-        self.subtitle_checkbox = ctk.CTkCheckBox(
-            self, text="自动添加同步字幕", variable=self.subtitle_var
-        )
-        self.subtitle_checkbox.grid(row=9, column=1, columnspan=2, padx=0, pady=(8, 2), sticky="w")
-
-        button_frame = ctk.CTkFrame(self, fg_color="transparent")
-        button_frame.grid(row=10, column=0, columnspan=3, pady=(14, 12))
-        self.preview_button = ctk.CTkButton(button_frame, text="试听配音", width=150, command=self._preview)
-        self.preview_button.pack(side="left", padx=10)
-        self.generate_button = ctk.CTkButton(button_frame, text="生成视频", width=150, command=self._generate_video)
-        self.generate_button.pack(side="left", padx=10)
-        self.publish_button = ctk.CTkButton(
-            button_frame,
-            text="生成并准备发布",
-            width=170,
-            command=lambda: self._generate_video(publish_after=True),
-        )
-        self.publish_button.pack(side="left", padx=10)
-        self.publish_existing_button = ctk.CTkButton(
-            button_frame,
-            text="发布已有视频",
-            width=150,
-            command=self._publish_existing_video,
-        )
-        self.publish_existing_button.pack(side="left", padx=10)
-
-        self.media_status_var = ctk.StringVar(value="实际配音时长：--\n模板视频：--\n状态：等待生成")
-        self.media_status_label = ctk.CTkLabel(self, textvariable=self.media_status_var, anchor="w", justify="left")
-        self.media_status_label.grid(row=11, column=0, columnspan=3, padx=28, pady=(4, 4), sticky="ew")
-
-        self.status_var = ctk.StringVar(value="状态：等待生成")
-        self.status_label = ctk.CTkLabel(self, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=12, column=0, columnspan=3, padx=28, pady=(4, 10), sticky="ew")
-
-        self.open_button = ctk.CTkButton(self, text="打开输出文件夹", command=self._open_output)
-        self.open_button.grid(row=13, column=0, columnspan=3, pady=(0, 24))
+    def _publish_result(self):
+        if self.latest_result and self.latest_result.is_file():
+            self._set_publish_video(self.latest_result)
+            self._switch_page("发布视频")
 
     def _load_historical_speech_rate(self) -> float:
         fallback = 4.5
@@ -176,7 +171,9 @@ class MainWindow(ctk.CTk):
         paths = sorted(
             path for path in self.video_assets_dir.iterdir()
             if path.is_file() and path.suffix.lower() in extensions
-        )[:5]
+        )
+        if len(paths) > 5:
+            self.after(0, lambda: messagebox.showinfo("模板数量提示", "模板超过5个，目前按文件名显示前5个有效模板。"))
         if not paths:
             fallback = self.project_root / "基础视频.mp4"
             if fallback.is_file():
@@ -185,9 +182,14 @@ class MainWindow(ctk.CTk):
         for index, path in enumerate(paths, start=1):
             try:
                 duration = duration_seconds(path, self.video_maker.ffprobe_path)
-            except Exception:
+                if not any(s.get("codec_type") == "video" for s in probe(path, self.video_maker.ffprobe_path).get("streams", [])):
+                    raise ValueError("文件没有视频画面")
+            except Exception as exc:
+                self.after(0, lambda name=path.name: messagebox.showwarning("跳过无效模板", f"无法读取模板：{name}，请检查文件是否损坏。"))
                 continue
             templates.append(VideoTemplate(path.resolve(), path.stem or f"模板{index}", duration))
+            if len(templates) == 5:
+                break
         return templates
 
     def _load_saved_template_path(self) -> Path | None:
@@ -226,7 +228,7 @@ class MainWindow(ctk.CTk):
                     ]
                 )
             image = Image.open(thumbnail).convert("RGB")
-            return ctk.CTkImage(light_image=image, dark_image=image, size=(132, 160))
+            return ctk.CTkImage(light_image=image, dark_image=image, size=(106, 128))
         except Exception:
             return None
 
@@ -235,7 +237,7 @@ class MainWindow(ctk.CTk):
         if not templates:
             ctk.CTkLabel(
                 self.template_frame,
-                text="assets/videos 中暂无视频，请点击下方按钮选择本地视频。",
+                text="暂无视频模板，请展开“管理模板”选择本地视频。",
             ).pack(padx=18, pady=24)
             return
         for column, template in enumerate(templates):
@@ -245,12 +247,14 @@ class MainWindow(ctk.CTk):
                 self.template_frame,
                 text=template.name,
                 width=148,
-                height=190 if image is not None else 55,
+                height=158 if image is not None else 55,
+                fg_color="#FFFFFF", hover_color="#F0F5FF", text_color="#1D1D1F",
+                border_color="#E5E5EA", border_width=1, corner_radius=12,
                 command=lambda item=template: self._select_template(item),
                 **kwargs,
             )
-            button.grid(row=0, column=column, padx=7, pady=9, sticky="nsew")
-            self.template_frame.grid_columnconfigure(column, weight=1)
+            button.grid(row=column // 3, column=column % 3, padx=6, pady=6, sticky="nsew")
+            self.template_frame.grid_columnconfigure(column % 3, weight=1)
             self.template_buttons.append(button)
             self.template_button_map[template.path] = button
             if image is not None:
@@ -262,11 +266,29 @@ class MainWindow(ctk.CTk):
         )
         self._select_template(initial, persist=False)
 
+    def _refresh_templates(self) -> None:
+        if self.busy:
+            return
+        for child in self.template_frame.winfo_children():
+            child.destroy()
+        for column in range(5):
+            self.template_frame.grid_columnconfigure(column, weight=0)
+        self.template_buttons.clear()
+        self.template_button_map.clear()
+        self.template_images.clear()
+        self.selected_template = None
+        self.video_var.set("")
+        self.template_info_var.set("当前选择：暂无可用模板")
+        self._build_template_picker()
+
     def _select_template(self, template: VideoTemplate, persist: bool = True) -> None:
         self.selected_template = template
         self.video_var.set(str(template.path))
         for path, button in self.template_button_map.items():
-            button.configure(border_width=3 if path == template.path else 0)
+            selected = path == template.path
+            button.configure(border_width=2 if selected else 1,
+                border_color="#007AFF" if selected else "#E5E5EA",
+                text=("✓  " if selected else "") + path.stem)
         if persist:
             self._save_template_path(template.path)
         if hasattr(self, "template_info_var"):
@@ -293,10 +315,7 @@ class MainWindow(ctk.CTk):
     ) -> None:
         state = "需要循环" if audio_duration > video_duration else "视频长度足够"
         message = (
-            f"当前选择：{template_name}\n"
-            f"实际配音时长：{audio_duration:.2f}秒\n"
-            f"模板视频：{video_duration:.2f}秒\n"
-            f"状态：{state}"
+            f"{template_name} · 配音 {audio_duration:.2f}秒 · 模板 {video_duration:.2f}秒 · {state}"
         )
         self.after(0, lambda: self.media_status_var.set(message))
 
@@ -348,12 +367,12 @@ class MainWindow(ctk.CTk):
             filetypes=[("视频文件", "*.mp4 *.mov *.mkv *.webm"), ("所有文件", "*.*")],
         )
         if path:
-            self.video_var.set(path)
             try:
                 duration = duration_seconds(path, self.video_maker.ffprobe_path)
+                self.video_var.set(path)
                 self.selected_template = VideoTemplate(Path(path).resolve(), "自选视频", duration)
-                for button in self.template_button_map.values():
-                    button.configure(border_width=0)
+                for template_path, button in self.template_button_map.items():
+                    button.configure(border_width=1, border_color="#E5E5EA", text=template_path.stem)
                 self._save_template_path(Path(path))
                 self.template_info_var.set(
                     f"当前选择：自选视频    视频长度：{duration:.2f}秒"
@@ -386,8 +405,11 @@ class MainWindow(ctk.CTk):
         self.after(0, lambda: self.preview_button.configure(state=state))
         self.after(0, lambda: self.generate_button.configure(state=state))
         self.after(0, lambda: self.publish_button.configure(state=state))
+        self.after(0, lambda: self.generate_publish_button.configure(state=state))
+        self.after(0, lambda: self.regenerate_button.configure(state=state))
         self.after(0, lambda: self.publish_existing_button.configure(state=state))
         self.after(0, lambda: self.select_button.configure(state=state))
+        self.after(0, lambda: self.refresh_templates_button.configure(state=state))
         self.after(0, lambda: self.subtitle_checkbox.configure(state=state))
         self.after(0, lambda: self.douyin_checkbox.configure(state=state))
         self.after(0, lambda: self.xiaohongshu_checkbox.configure(state=state))
@@ -432,31 +454,62 @@ class MainWindow(ctk.CTk):
         publish_fields: tuple[str, str, list[str]],
     ) -> None:
         title, tags, platforms = publish_fields
-        self._set_status("正在准备发布文件和打开上传页面…")
-        package = self.publisher.prepare(
-            video,
-            self.output_dir,
-            stamp,
-            title,
-            tags,
-            platforms,
-        )
-        self._copy_to_clipboard(package.caption)
-        self.publisher.reveal_video(package.video_path)
-        self.publisher.open_upload_pages(platforms)
-        self._set_status(f"发布页面已打开：{Path(video).name}（标题和标签已复制）")
-        platform_names = "、".join(
-            "抖音" if item == "douyin" else "小红书" for item in platforms
-        )
-        self.after(
-            0,
-            lambda: messagebox.showinfo(
-                "发布助手已准备完成",
-                f"已打开：{platform_names}\n"
-                "已在资源管理器中选中视频，并复制标题和标签。\n\n"
-                "请把视频拖入上传页面，粘贴文案，检查后点击发布。",
-            ),
-        )
+        metadata = probe(video, self.video_maker.ffprobe_path)
+        if not any(stream.get("codec_type") == "video" for stream in metadata.get("streams", [])):
+            raise ValueError("请选择包含视频画面的成片文件。")
+        self._set_status("正在准备视频，即将自动上传和填写…")
+        self._copy_to_clipboard(compose_caption(title, tags))
+        self.pending_upload = (Path(video), (title, tags, list(platforms)))
+        control = UploadControl()
+        self.upload_control = control
+        self.after(0, lambda: self.cancel_upload_button.configure(state="normal"))
+        self.after(0, self._sync_context_actions)
+        try:
+            results = self.browser_uploader.submit(
+                Path(video).resolve(), title, tags, platforms,
+                self._set_status, self._upload_handoff, control,
+            ).result()
+            detail = "\n\n".join(
+                f"{'抖音' if item.platform == 'douyin' else '小红书'}：{item.message}"
+                for item in results
+            )
+            ready = all(item.ready for item in results)
+            failed = [item.platform for item in results if not item.ready]
+            self.pending_upload = (Path(video), (title, tags, failed)) if failed else None
+            self._set_status("上传和填写完成，等待你在网页确认发布" if ready else "部分步骤需要处理，请查看发布窗口")
+            self.after(0, lambda: messagebox.showinfo("请检查发布页面", detail))
+        except UploadCancelled as exc:
+            self._set_status(str(exc))
+        finally:
+            self.upload_control = None
+            self.after(0, lambda: self.cancel_upload_button.configure(state="disabled"))
+            self.after(0, lambda: self.resume_upload_button.configure(
+                text="重试失败平台" if self.pending_upload else "继续上传",
+                state="normal" if self.pending_upload else "disabled"))
+            self.after(0, self._sync_context_actions)
+
+    def _upload_handoff(self, message: str | None) -> None:
+        def update() -> None:
+            self.resume_upload_button.configure(text="继续上传", state="normal" if message else "disabled")
+            self._sync_context_actions()
+            if message:
+                self.status_var.set(f"状态：{message}")
+        self.after(0, update)
+
+    def _resume_upload(self) -> None:
+        if self.upload_control is not None:
+            self.upload_control.resume.set()
+            self.resume_upload_button.configure(state="disabled")
+            self._sync_context_actions()
+        elif self.pending_upload is not None and not self.busy:
+            video, fields = self.pending_upload
+            self._run_worker(lambda: self._prepare_publish(video, "", fields), error_title="上传失败")
+
+    def _cancel_upload(self) -> None:
+        if self.upload_control is not None:
+            self.upload_control.cancelled.set()
+            self.cancel_upload_button.configure(state="disabled")
+            self._set_status("正在停止自动操作，已上传内容保留在网页中…")
 
     def _publish_existing_video(self) -> None:
         if self.busy:
@@ -481,9 +534,9 @@ class MainWindow(ctk.CTk):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._prepare_publish(path, stamp, publish_fields)
 
-        self._run_worker(action)
+        self._run_worker(action, error_title="上传失败")
 
-    def _run_worker(self, action) -> None:
+    def _run_worker(self, action, error_title: str = "生成失败") -> None:
         if self.busy:
             return
         self._set_busy(True)
@@ -492,9 +545,10 @@ class MainWindow(ctk.CTk):
             try:
                 action()
             except Exception as exc:
-                self._set_status("生成失败")
-                error_message = str(exc)
-                self.after(0, lambda: messagebox.showerror("生成失败", error_message))
+                logging.exception("任务失败：%s", error_title)
+                self._set_status(error_title)
+                error_message = str(exc)[-700:] + "\n\n已成功生成的配音会保留；相同文案再次生成时自动复用。如提示语音内容不匹配，请先点“下次重新配音”。详细记录见 logs/app.log。"
+                self.after(0, lambda: messagebox.showerror(error_title, error_message))
             finally:
                 self._set_busy(False)
 
@@ -533,17 +587,33 @@ class MainWindow(ctk.CTk):
             return
 
         def action() -> None:
-            self._ensure_tts_service()
+            require_space(self.output_dir)
+            if subtitles_enabled:
+                self._set_status("正在检查文案读法与字幕兼容性…")
+                self.subtitle_pipeline.aligner.preflight(text)
             generated_at = datetime.now()
             stamp = generated_at.strftime("%Y%m%d_%H%M%S")
-            audio = self.temp_dir / f"voice_{stamp}.wav"
+            key = voice_cache_key(text, self.tts.config, self.project_root)
+            audio = self.temp_dir / f"cached_voice_{key}.wav"
             output = self.output_dir / build_video_filename(
                 text,
                 output_title,
                 generated_at,
             )
-            self._set_status("正在生成胖猫配音…")
-            self.tts.generate(text, audio)
+            reusable = False
+            if audio.is_file() and not self.force_voice:
+                try:
+                    validate_wav(audio)
+                    reusable = True
+                except Exception:
+                    pass
+            if reusable:
+                self._set_status("复用已完成配音，继续字幕和合成…")
+            else:
+                self._ensure_tts_service()
+                self._set_status("正在生成胖猫配音…")
+                self.tts.generate(text, audio)
+                self.force_voice = False
             audio_duration = duration_seconds(audio, self.video_maker.ffprobe_path)
             video_duration = duration_seconds(video, self.video_maker.ffprobe_path)
             self._set_media_status(audio_duration, video_duration, template_name)
@@ -554,10 +624,16 @@ class MainWindow(ctk.CTk):
                     return
             subtitle = None
             if subtitles_enabled:
-                self._set_status("正在按真实语音时间对齐字幕…")
-                subtitle = self.subtitle_pipeline.create(
-                    text, audio, video, self.temp_dir / f"subtitle_{stamp}.ass"
-                )
+                subtitle_key = hashlib.sha256(str((key, audio.stat().st_mtime_ns,
+                    str(video), video.stat().st_mtime_ns, video.stat().st_size)).encode()).hexdigest()[:24]
+                subtitle = self.temp_dir / f"cached_subtitle_{subtitle_key}.ass"
+                if subtitle.is_file():
+                    self._set_status("复用已完成字幕，继续合成…")
+                else:
+                    self._set_status("正在按真实语音时间对齐字幕…")
+                    partial_ass = subtitle.with_suffix(".partial.ass")
+                    self.subtitle_pipeline.create(text, audio, video, partial_ass)
+                    partial_ass.replace(subtitle)
             self._set_status("正在裁剪并合成视频…")
             result = self.video_maker.make(video, audio, output, subtitle_path=subtitle)
             detail = (
@@ -565,6 +641,7 @@ class MainWindow(ctk.CTk):
                 f"循环 {result.loops} 次，成片 {result.output_duration:.2f}s"
             )
             self._set_status(f"生成完成｜本次生成文件：{output.name}｜{detail}")
+            self.after(0, lambda: self._show_result(output))
             if publish_fields is not None:
                 self._prepare_publish(output, stamp, publish_fields)
                 return
@@ -575,13 +652,33 @@ class MainWindow(ctk.CTk):
 
         self._run_worker(action)
 
+    def _force_next_voice(self) -> None:
+        if not self.busy:
+            self.force_voice = True
+            self._set_status("下次生成将重新配音，不复用旧配音。")
+
     def _open_output(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(self.output_dir)
 
     def _on_close(self) -> None:
+        if self.busy and self.upload_control is None:
+            messagebox.showinfo("任务正在进行", "请等待当前生成完成后关闭，配音和成片不会丢失。")
+            return
+        if self.upload_control is not None and not messagebox.askyesno(
+            "停止上传并退出？", "正在上传或等待登录。退出会停止自动操作并关闭专用发布窗口，确定退出？"
+        ):
+            return
+        self.browser_uploader.close()
+        self._set_status("正在关闭发布窗口并保存登录状态…")
+        self._finish_close()
+
+    def _finish_close(self) -> None:
+        thread = self.browser_uploader._thread
+        if thread is not None and thread.is_alive():
+            self.after(100, self._finish_close)
+            return
         process = self.tts_process
         if process is not None and process.poll() is None:
             process.terminate()
         self.destroy()
-

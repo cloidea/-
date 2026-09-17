@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .base import TTSProvider
+from video.reliability import require_space, validate_wav
+from subtitles.align_worker import spoken_text
 
 
 class GPTSoVITSError(RuntimeError):
@@ -107,7 +109,7 @@ class GPTSoVITSProvider(TTSProvider):
         raise GPTSoVITSError(f"等待 GPT-SoVITS 服务启动超时。日志：{log_path}")
 
     def generate(self, text: str, output_path: str | Path) -> str:
-        target_text = text.strip()
+        target_text = spoken_text(text.strip())
         if not target_text:
             raise GPTSoVITSError("待生成文案不能为空。")
         if not self.is_service_ready():
@@ -115,6 +117,7 @@ class GPTSoVITSProvider(TTSProvider):
 
         output = Path(output_path).resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
+        require_space(output.parent)
         payload = {
             "text": target_text,
             "text_lang": str(self.config.get("target_language", "zh")),
@@ -146,5 +149,11 @@ class GPTSoVITSProvider(TTSProvider):
         if "audio" not in content_type.lower() and not audio.startswith(b"RIFF"):
             detail = audio[:500].decode("utf-8", errors="replace")
             raise GPTSoVITSError(f"GPT-SoVITS 未返回 WAV 音频：{detail}")
-        output.write_bytes(audio)
+        temporary = output.with_suffix(".partial.wav")
+        try:
+            temporary.write_bytes(audio)
+            validate_wav(temporary)
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
         return str(output)

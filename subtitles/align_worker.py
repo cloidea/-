@@ -3,12 +3,35 @@ from __future__ import annotations
 import json
 import math
 import sys
+import unicodedata
+import re
 from pathlib import Path
 
 
 IGNORED = set("，。！？；：、,.!?;:\"'“”‘’（）()【】[]《》<>…—- \t\r\n")
 DIGITS = set("0123456789")
 CHINESE_DIGITS = "零一二三四五六七八九"
+NUMBER = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d+(?:[.．]\d+)?[%％]?")
+
+
+def _read_number(raw):
+    value = unicodedata.normalize("NFKC", raw)
+    if "-" in value or "/" in value:
+        from datetime import date
+        y, m, d = re.split(r"[-/]", value)
+        date(int(y), int(m), int(d))
+        return "".join(CHINESE_DIGITS[int(c)] for c in y) + "年" + _integer_to_chinese(m.lstrip("0") or "0") + "月" + _integer_to_chinese(d.lstrip("0") or "0") + "日"
+    percent = value.endswith("%")
+    value = value.rstrip("%")
+    parts = value.split(".")
+    speech = _integer_to_chinese(parts[0])
+    if len(parts) == 2:
+        speech += "点" + "".join(CHINESE_DIGITS[int(c)] for c in parts[1])
+    return ("百分之" if percent else "") + speech
+
+
+def spoken_text(text):
+    return NUMBER.sub(lambda match: _read_number(match.group()), text)
 
 
 def _integer_to_chinese(value: str) -> str:
@@ -46,17 +69,70 @@ def _alignment_units(text: str) -> list[tuple[str, str]]:
         if char in IGNORED:
             index += 1
             continue
-        if char in DIGITS:
-            end = index + 1
-            while end < len(text) and text[end] in DIGITS:
-                end += 1
-            raw = text[index:end]
-            units.append((raw, _integer_to_chinese(raw)))
-            index = end
+        number = NUMBER.match(text, index)
+        if number:
+            raw = number.group()
+            units.append((raw, _read_number(raw)))
+            index = number.end()
             continue
-        units.append((char, char.lower()))
+        units.append((char, unicodedata.normalize("NFKC", char).lower()))
         index += 1
     return units
+
+
+def _acoustic_candidates(chars, tokenizer):
+    """Use same-pronunciation characters only for out-of-vocabulary Hanzi.
+
+    The display text is never changed. Unknown punctuation/symbols do not get
+    arbitrary timestamps: unsupported pronunciations still produce an error.
+    """
+    ids = [tokenizer.convert_tokens_to_ids(char) for char in chars]
+    missing = [i for i, token in enumerate(ids) if token is None or token == tokenizer.unk_token_id]
+    result = [[token] for token in ids]
+    if not missing:
+        return result
+    from pypinyin import Style, lazy_pinyin, pinyin
+
+    pronunciations = lazy_pinyin("".join(chars), style=Style.TONE3, neutral_tone_with_five=True)
+    if len(pronunciations) != len(chars):
+        raise RuntimeError("文案含有无法按字解析的发音，请将特殊符号写为实际读音。")
+    vocab_by_sound = {}
+    for char, token in tokenizer.get_vocab().items():
+        if len(char) != 1 or not ('\u3400' <= char <= '\u9fff'):
+            continue
+        if token in tokenizer.all_special_ids:
+            continue
+        sounds = pinyin(char, style=Style.TONE3, heteronym=True, neutral_tone_with_five=True)[0]
+        for sound in sounds:
+            vocab_by_sound.setdefault(sound, []).append(token)
+    unsupported = []
+    for index in missing:
+        char = chars[index]
+        candidates = vocab_by_sound.get(pronunciations[index], []) if '\u3400' <= char <= '\u9fff' else []
+        if not candidates:
+            unsupported.append(char)
+        else:
+            result[index] = sorted(set(candidates))
+    if unsupported:
+        raise RuntimeError("这些字符没有可用的发音映射，请改写为实际读音：" + "".join(dict.fromkeys(unsupported)))
+    return result
+
+
+def _extend_emission(emission, candidates):
+    import torch
+    columns = []
+    synthetic = {}
+    tokens = []
+    for group in candidates:
+        if len(group) == 1:
+            tokens.append(group[0])
+            continue
+        key = tuple(group)
+        if key not in synthetic:
+            synthetic[key] = emission.shape[1] + len(columns)
+            columns.append(torch.logsumexp(emission[:, group], dim=-1, keepdim=True))
+        tokens.append(synthetic[key])
+    return (torch.cat([emission, *columns], dim=-1) if columns else emission), tokens
 
 
 def _ctc_path(emission, token_ids: list[int], blank_id: int) -> list[int]:
@@ -135,17 +211,14 @@ def align(request: dict) -> list[dict]:
     if not units:
         raise RuntimeError("文案中没有可对齐的文字。")
     chars = [char for _, normalized in units for char in normalized]
-    unknown_id = tokenizer.unk_token_id
-    token_ids = [tokenizer.convert_tokens_to_ids(char.lower()) for char in chars]
-    missing = [char for char, token in zip(chars, token_ids) if token == unknown_id]
-    if missing:
-        raise RuntimeError(f"对齐模型词表不包含这些字符：{''.join(dict.fromkeys(missing))}")
+    candidates = _acoustic_candidates(chars, tokenizer)
 
     inputs = processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt")
     model = model.to(device).eval()
     with torch.inference_mode():
         logits = model(inputs.input_values.to(device)).logits[0]
         emission = logits.log_softmax(dim=-1).cpu()
+    emission, token_ids = _extend_emission(emission, candidates)
     blank_id = tokenizer.pad_token_id
     path = _ctc_path(emission, token_ids, blank_id)
     frame_seconds = duration / emission.shape[0]
@@ -187,6 +260,8 @@ def align(request: dict) -> list[dict]:
             continue
         step = max(0.0001, (end - start) / len(original))
         for position, char in enumerate(original):
+            if char in IGNORED:
+                continue
             result.append(
                 {
                     "text": char,
@@ -202,7 +277,16 @@ def main() -> int:
     request_path = Path(sys.argv[1])
     response_path = Path(sys.argv[2])
     request = json.loads(request_path.read_text(encoding="utf-8"))
-    result = align(request)
+    if request.get("preflight"):
+        from transformers import Wav2Vec2CTCTokenizer
+        tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(request["model"], local_files_only=True)
+        units = _alignment_units(request["text"])
+        if not units:
+            raise RuntimeError("文案只有标点或空格，请输入需要朗读的内容。")
+        _acoustic_candidates([char for _, normalized in units for char in normalized], tokenizer)
+        result = []
+    else:
+        result = align(request)
     response_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
     return 0
 
