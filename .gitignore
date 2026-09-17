@@ -11,6 +11,12 @@ logs/
 output/
 voice/temp/
 
+# Local video templates (keep code-only Git history)
+assets/videos/*.mp4
+assets/videos/*.mov
+assets/videos/*.mkv
+assets/videos/*.webm
+
 # Local document inspection artifacts
 .codex_doc_review/
 

@@ -6,7 +6,9 @@ from pathlib import Path
 
 from tts.gpt_sovits import GPTSoVITSProvider
 from subtitles.base import TimedToken
+from subtitles.align_worker import _alignment_units, _integer_to_chinese
 from subtitles.pagination import SubtitlePaginator
+from ui.duration_estimator import count_speakable_characters, estimate_duration_range
 from video.ffmpeg_utils import duration_seconds, resolve_executable
 
 
@@ -31,6 +33,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(short_audio_duration, 2.66)
         self.assertEqual(math.ceil(short_audio_duration / video_duration), 1)
         self.assertEqual(math.ceil(long_audio_duration / video_duration), 3)
+
+    def test_duration_estimate_is_advisory_and_marks_long_copy(self) -> None:
+        self.assertEqual(count_speakable_characters("睡了吗？"), 3)
+        short_range = estimate_duration_range("睡了吗？还没睡啊。", 4.5)
+        long_range = estimate_duration_range("猫咪今天决定认真工作。" * 12, 4.5)
+        self.assertGreaterEqual(short_range[0], 1)
+        self.assertGreater(long_range[1], 15)
+
+    def test_arabic_numbers_are_normalized_for_chinese_alignment(self) -> None:
+        self.assertEqual(_integer_to_chinese("20"), "二十")
+        self.assertEqual(_integer_to_chinese("16"), "十六")
+        self.assertEqual(
+            _alignment_units("前方 20 米掉头。"),
+            [("前", "前"), ("方", "方"), ("20", "二十"), ("米", "米"), ("掉", "掉"), ("头", "头")],
+        )
 
     def test_subtitle_pagination_uses_real_token_timestamps(self) -> None:
         text = "睡了吗？还没睡啊，那没事，你继续刷吧。"

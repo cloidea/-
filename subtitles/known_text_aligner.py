@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import subprocess
 import tempfile
@@ -64,9 +65,18 @@ class KnownTextCTCAligner(AlignmentProvider):
                 json.dump(request_data, handle, ensure_ascii=False)
                 request_file = Path(handle.name)
             response_file = request_file.with_suffix(".result.json")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONWARNINGS": "ignore",
+                }
+            )
             result = subprocess.run(
                 [str(python), str(worker), str(request_file), str(response_file)],
                 cwd=self.project_root,
+                env=environment,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

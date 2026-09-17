@@ -7,6 +7,56 @@ from pathlib import Path
 
 
 IGNORED = set("，。！？；：、,.!?;:\"'“”‘’（）()【】[]《》<>…—- \t\r\n")
+DIGITS = set("0123456789")
+CHINESE_DIGITS = "零一二三四五六七八九"
+
+
+def _integer_to_chinese(value: str) -> str:
+    """Normalize short Arabic integers to the form normally spoken by Chinese TTS."""
+    if not value or any(char not in DIGITS for char in value):
+        return value
+    if len(value) > 4 or (len(value) > 1 and value.startswith("0")):
+        return "".join(CHINESE_DIGITS[int(char)] for char in value)
+    number = int(value)
+    if number == 0:
+        return CHINESE_DIGITS[0]
+    units = ((1000, "千"), (100, "百"), (10, "十"), (1, ""))
+    output: list[str] = []
+    pending_zero = False
+    for divisor, unit in units:
+        digit, number = divmod(number, divisor)
+        if digit:
+            if pending_zero and output:
+                output.append("零")
+            if not (divisor == 10 and digit == 1 and not output):
+                output.append(CHINESE_DIGITS[digit])
+            output.append(unit)
+            pending_zero = False
+        elif output and number:
+            pending_zero = True
+    return "".join(output)
+
+
+def _alignment_units(text: str) -> list[tuple[str, str]]:
+    """Return (subtitle text, acoustic alignment text) units."""
+    units: list[tuple[str, str]] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in IGNORED:
+            index += 1
+            continue
+        if char in DIGITS:
+            end = index + 1
+            while end < len(text) and text[end] in DIGITS:
+                end += 1
+            raw = text[index:end]
+            units.append((raw, _integer_to_chinese(raw)))
+            index = end
+            continue
+        units.append((char, char.lower()))
+        index += 1
+    return units
 
 
 def _ctc_path(emission, token_ids: list[int], blank_id: int) -> list[int]:
@@ -81,9 +131,10 @@ def align(request: dict) -> list[dict]:
     duration = waveform.numel() / 16000.0
 
     tokenizer = processor.tokenizer
-    chars = [char for char in request["text"] if char not in IGNORED]
-    if not chars:
+    units = _alignment_units(request["text"])
+    if not units:
         raise RuntimeError("文案中没有可对齐的文字。")
+    chars = [char for _, normalized in units for char in normalized]
     unknown_id = tokenizer.unk_token_id
     token_ids = [tokenizer.convert_tokens_to_ids(char.lower()) for char in chars]
     missing = [char for char, token in zip(chars, token_ids) if token == unknown_id]
@@ -99,13 +150,13 @@ def align(request: dict) -> list[dict]:
     path = _ctc_path(emission, token_ids, blank_id)
     frame_seconds = duration / emission.shape[0]
 
-    result = []
+    aligned_tokens = []
     for index, char in enumerate(chars):
         state = index * 2 + 1
         frames = [i for i, value in enumerate(path) if value == state]
         if not frames:
             raise RuntimeError(f"字符未获得有效时间戳：{char}")
-        result.append(
+        aligned_tokens.append(
             {
                 "text": char,
                 "start": round(frames[0] * frame_seconds, 4),
@@ -115,6 +166,35 @@ def align(request: dict) -> list[dict]:
                 ),
             }
         )
+
+    result = []
+    aligned_index = 0
+    for original, normalized in units:
+        group = aligned_tokens[aligned_index : aligned_index + len(normalized)]
+        aligned_index += len(normalized)
+        start = float(group[0]["start"])
+        end = float(group[-1]["end"])
+        confidence = sum(float(token["confidence"]) for token in group) / len(group)
+        if len(original) == 1:
+            result.append(
+                {
+                    "text": original,
+                    "start": round(start, 4),
+                    "end": round(end, 4),
+                    "confidence": round(confidence, 6),
+                }
+            )
+            continue
+        step = max(0.0001, (end - start) / len(original))
+        for position, char in enumerate(original):
+            result.append(
+                {
+                    "text": char,
+                    "start": round(start + position * step, 4),
+                    "end": round(start + (position + 1) * step, 4),
+                    "confidence": round(confidence, 6),
+                }
+            )
     return result
 
 
