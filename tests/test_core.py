@@ -4,6 +4,7 @@ import unittest
 import math
 from pathlib import Path
 
+from publish.assistant import compose_caption, normalize_hashtags
 from tts.gpt_sovits import GPTSoVITSProvider
 from subtitles.base import TimedToken
 from subtitles.align_worker import _alignment_units, _integer_to_chinese
@@ -47,6 +48,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(
             _alignment_units("前方 20 米掉头。"),
             [("前", "前"), ("方", "方"), ("20", "二十"), ("米", "米"), ("掉", "掉"), ("头", "头")],
+        )
+
+    def test_publish_caption_normalizes_and_deduplicates_hashtags(self) -> None:
+        self.assertEqual(
+            normalize_hashtags("猫咪，#搞笑 猫咪"),
+            "#猫咪 #搞笑",
+        )
+        self.assertEqual(
+            compose_caption("猫咪冷知识", "猫咪 #搞笑"),
+            "猫咪冷知识\n#猫咪 #搞笑",
         )
 
     def test_subtitle_pagination_uses_real_token_timestamps(self) -> None:

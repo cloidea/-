@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image
 
+from publish.assistant import PublishAssistant
 from tts.gpt_sovits import GPTSoVITSProvider
 from subtitles.pipeline import SubtitlePipeline
 from ui.duration_estimator import count_speakable_characters, estimate_duration_range
@@ -41,6 +42,7 @@ class MainWindow(ctk.CTk):
         self.tts = GPTSoVITSProvider(self.project_root / "config.json")
         self.video_maker = VideoMaker(self.project_root / "config.json")
         self.subtitle_pipeline = SubtitlePipeline(self.project_root / "config.json")
+        self.publisher = PublishAssistant(self.video_maker.ffmpeg_path)
         self.tts_process: subprocess.Popen[bytes] | None = None
         self.service_lock = threading.Lock()
         self.busy = False
@@ -51,8 +53,8 @@ class MainWindow(ctk.CTk):
         self.speech_chars_per_second = self._load_historical_speech_rate()
 
         self.title("猫咪沙雕短视频生成器")
-        self.geometry("980x780")
-        self.minsize(820, 700)
+        self.geometry("980x900")
+        self.minsize(820, 780)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         ctk.set_appearance_mode("system")
 
@@ -93,32 +95,59 @@ class MainWindow(ctk.CTk):
         self.estimate_label.grid(row=4, column=1, columnspan=2, padx=0, pady=(0, 5), sticky="w")
         self._update_duration_estimate()
 
-        ctk.CTkLabel(self, text="音色：").grid(row=5, column=0, padx=(28, 10), pady=8, sticky="w")
-        ctk.CTkLabel(self, text="胖猫（固定）", anchor="w").grid(row=5, column=1, columnspan=2, padx=0, pady=8, sticky="w")
+        ctk.CTkLabel(self, text="发布标题：").grid(row=5, column=0, padx=(28, 10), pady=6, sticky="w")
+        self.publish_title_entry = ctk.CTkEntry(self, placeholder_text="例如：猫咪冷知识，最后一句绷不住了")
+        self.publish_title_entry.grid(row=5, column=1, columnspan=2, padx=(0, 28), pady=6, sticky="ew")
+
+        ctk.CTkLabel(self, text="发布标签：").grid(row=6, column=0, padx=(28, 10), pady=6, sticky="w")
+        self.publish_tags_entry = ctk.CTkEntry(self, placeholder_text="#猫咪 #搞笑 #沙雕配音")
+        self.publish_tags_entry.grid(row=6, column=1, columnspan=2, padx=(0, 28), pady=6, sticky="ew")
+
+        ctk.CTkLabel(self, text="发布平台：").grid(row=7, column=0, padx=(28, 10), pady=6, sticky="w")
+        platform_frame = ctk.CTkFrame(self, fg_color="transparent")
+        platform_frame.grid(row=7, column=1, columnspan=2, padx=0, pady=6, sticky="w")
+        self.douyin_var = ctk.BooleanVar(value=True)
+        self.xiaohongshu_var = ctk.BooleanVar(value=False)
+        self.douyin_checkbox = ctk.CTkCheckBox(platform_frame, text="抖音", variable=self.douyin_var)
+        self.douyin_checkbox.pack(side="left", padx=(0, 24))
+        self.xiaohongshu_checkbox = ctk.CTkCheckBox(
+            platform_frame, text="小红书", variable=self.xiaohongshu_var
+        )
+        self.xiaohongshu_checkbox.pack(side="left")
+
+        ctk.CTkLabel(self, text="音色：").grid(row=8, column=0, padx=(28, 10), pady=8, sticky="w")
+        ctk.CTkLabel(self, text="胖猫（固定）", anchor="w").grid(row=8, column=1, columnspan=2, padx=0, pady=8, sticky="w")
 
         self.subtitle_var = ctk.BooleanVar(value=True)
         self.subtitle_checkbox = ctk.CTkCheckBox(
             self, text="自动添加同步字幕", variable=self.subtitle_var
         )
-        self.subtitle_checkbox.grid(row=6, column=1, columnspan=2, padx=0, pady=(8, 2), sticky="w")
+        self.subtitle_checkbox.grid(row=9, column=1, columnspan=2, padx=0, pady=(8, 2), sticky="w")
 
         button_frame = ctk.CTkFrame(self, fg_color="transparent")
-        button_frame.grid(row=7, column=0, columnspan=3, pady=(14, 12))
+        button_frame.grid(row=10, column=0, columnspan=3, pady=(14, 12))
         self.preview_button = ctk.CTkButton(button_frame, text="试听配音", width=150, command=self._preview)
         self.preview_button.pack(side="left", padx=10)
         self.generate_button = ctk.CTkButton(button_frame, text="生成视频", width=150, command=self._generate_video)
         self.generate_button.pack(side="left", padx=10)
+        self.publish_button = ctk.CTkButton(
+            button_frame,
+            text="生成并准备发布",
+            width=170,
+            command=lambda: self._generate_video(publish_after=True),
+        )
+        self.publish_button.pack(side="left", padx=10)
 
         self.media_status_var = ctk.StringVar(value="实际配音时长：--\n模板视频：--\n状态：等待生成")
         self.media_status_label = ctk.CTkLabel(self, textvariable=self.media_status_var, anchor="w", justify="left")
-        self.media_status_label.grid(row=8, column=0, columnspan=3, padx=28, pady=(4, 4), sticky="ew")
+        self.media_status_label.grid(row=11, column=0, columnspan=3, padx=28, pady=(4, 4), sticky="ew")
 
         self.status_var = ctk.StringVar(value="状态：等待生成")
         self.status_label = ctk.CTkLabel(self, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=9, column=0, columnspan=3, padx=28, pady=(4, 10), sticky="ew")
+        self.status_label.grid(row=12, column=0, columnspan=3, padx=28, pady=(4, 10), sticky="ew")
 
         self.open_button = ctk.CTkButton(self, text="打开输出文件夹", command=self._open_output)
-        self.open_button.grid(row=10, column=0, columnspan=3, pady=(0, 24))
+        self.open_button.grid(row=13, column=0, columnspan=3, pady=(0, 24))
 
     def _load_historical_speech_rate(self) -> float:
         fallback = 4.5
@@ -348,13 +377,44 @@ class MainWindow(ctk.CTk):
         state = "disabled" if busy else "normal"
         self.after(0, lambda: self.preview_button.configure(state=state))
         self.after(0, lambda: self.generate_button.configure(state=state))
+        self.after(0, lambda: self.publish_button.configure(state=state))
         self.after(0, lambda: self.select_button.configure(state=state))
         self.after(0, lambda: self.subtitle_checkbox.configure(state=state))
+        self.after(0, lambda: self.douyin_checkbox.configure(state=state))
+        self.after(0, lambda: self.xiaohongshu_checkbox.configure(state=state))
+        self.after(0, lambda: self.publish_title_entry.configure(state=state))
+        self.after(0, lambda: self.publish_tags_entry.configure(state=state))
         for button in self.template_buttons:
             self.after(0, lambda item=button: item.configure(state=state))
 
     def _set_status(self, message: str) -> None:
         self.after(0, lambda: self.status_var.set(f"状态：{message}"))
+
+    def _copy_to_clipboard(self, value: str) -> None:
+        completed = threading.Event()
+
+        def copy() -> None:
+            self.clipboard_clear()
+            self.clipboard_append(value)
+            self.update_idletasks()
+            completed.set()
+
+        self.after(0, copy)
+        completed.wait(timeout=5)
+
+    def _publish_fields(self) -> tuple[str, str, list[str]]:
+        title = self.publish_title_entry.get().strip()
+        tags = self.publish_tags_entry.get().strip()
+        platforms: list[str] = []
+        if self.douyin_var.get():
+            platforms.append("douyin")
+        if self.xiaohongshu_var.get():
+            platforms.append("xiaohongshu")
+        if not title:
+            raise ValueError("请先填写发布标题。")
+        if not platforms:
+            raise ValueError("请至少选择一个发布平台。")
+        return title, tags, platforms
 
     def _run_worker(self, action) -> None:
         if self.busy:
@@ -391,7 +451,7 @@ class MainWindow(ctk.CTk):
 
         self._run_worker(action)
 
-    def _generate_video(self) -> None:
+    def _generate_video(self, publish_after: bool = False) -> None:
         try:
             text = self._text()
             video = self._video()
@@ -399,6 +459,7 @@ class MainWindow(ctk.CTk):
                 self.selected_template.name if self.selected_template is not None else video.stem
             )
             subtitles_enabled = bool(self.subtitle_var.get())
+            publish_fields = self._publish_fields() if publish_after else None
         except Exception as exc:
             messagebox.showerror("无法生成", str(exc))
             return
@@ -431,6 +492,34 @@ class MainWindow(ctk.CTk):
                 f"循环 {result.loops} 次，成片 {result.output_duration:.2f}s"
             )
             self._set_status(f"生成完成：{detail}")
+            if publish_fields is not None:
+                title, tags, platforms = publish_fields
+                self._set_status("正在准备发布文件和打开上传页面…")
+                package = self.publisher.prepare(
+                    output,
+                    self.output_dir,
+                    stamp,
+                    title,
+                    tags,
+                    platforms,
+                )
+                self._copy_to_clipboard(package.caption)
+                self.publisher.reveal_video(package.video_path)
+                self.publisher.open_upload_pages(platforms)
+                self._set_status("发布页面已打开，标题和标签已复制")
+                platform_names = "、".join(
+                    "抖音" if item == "douyin" else "小红书" for item in platforms
+                )
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "发布助手已准备完成",
+                        f"已打开：{platform_names}\n"
+                        "已在资源管理器中选中视频，并复制标题和标签。\n\n"
+                        "请把视频拖入上传页面，粘贴文案，检查后点击发布。",
+                    ),
+                )
+                return
             self.after(
                 0,
                 lambda: messagebox.showinfo("生成完成", f"{detail}\n\n视频已保存到：\n{output}"),
