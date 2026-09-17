@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import math
+from datetime import datetime
 from pathlib import Path
 
 from publish.assistant import compose_caption, normalize_hashtags
@@ -11,6 +12,7 @@ from subtitles.align_worker import _alignment_units, _integer_to_chinese
 from subtitles.pagination import SubtitlePaginator
 from ui.duration_estimator import count_speakable_characters, estimate_duration_range
 from video.ffmpeg_utils import duration_seconds, resolve_executable
+from video.output_naming import build_video_filename
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +62,17 @@ class CoreTests(unittest.TestCase):
             "猫咪冷知识\n#猫咪 #搞笑",
         )
 
+    def test_generated_video_filename_is_readable_and_windows_safe(self) -> None:
+        generated_at = datetime(2026, 9, 17, 19, 54, 30)
+        self.assertEqual(
+            build_video_filename("问你个冷知识：前方20米掉头。", "猫咪冷知识", generated_at),
+            "胖猫成片_20260917_195430_猫咪冷知识.mp4",
+        )
+        self.assertEqual(
+            build_video_filename("  不能/使用:*的标题？  ", generated_at=generated_at),
+            "胖猫成片_20260917_195430_不能使用的标题.mp4",
+        )
+
     def test_subtitle_pagination_uses_real_token_timestamps(self) -> None:
         text = "睡了吗？还没睡啊，那没事，你继续刷吧。"
         chars = [char for char in text if char not in "，。？！"]
@@ -81,3 +94,4 @@ class CoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

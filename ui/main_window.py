@@ -17,6 +17,7 @@ from tts.gpt_sovits import GPTSoVITSProvider
 from subtitles.pipeline import SubtitlePipeline
 from ui.duration_estimator import count_speakable_characters, estimate_duration_range
 from video.ffmpeg_utils import duration_seconds, resolve_executable, run_checked
+from video.output_naming import build_video_filename
 from video.video_maker import VideoMaker
 
 
@@ -443,7 +444,7 @@ class MainWindow(ctk.CTk):
         self._copy_to_clipboard(package.caption)
         self.publisher.reveal_video(package.video_path)
         self.publisher.open_upload_pages(platforms)
-        self._set_status("发布页面已打开，标题和标签已复制")
+        self._set_status(f"发布页面已打开：{Path(video).name}（标题和标签已复制）")
         platform_names = "、".join(
             "抖音" if item == "douyin" else "小红书" for item in platforms
         )
@@ -525,6 +526,7 @@ class MainWindow(ctk.CTk):
                 self.selected_template.name if self.selected_template is not None else video.stem
             )
             subtitles_enabled = bool(self.subtitle_var.get())
+            output_title = self.publish_title_entry.get().strip()
             publish_fields = self._publish_fields() if publish_after else None
         except Exception as exc:
             messagebox.showerror("无法生成", str(exc))
@@ -532,9 +534,14 @@ class MainWindow(ctk.CTk):
 
         def action() -> None:
             self._ensure_tts_service()
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            generated_at = datetime.now()
+            stamp = generated_at.strftime("%Y%m%d_%H%M%S")
             audio = self.temp_dir / f"voice_{stamp}.wav"
-            output = self.output_dir / f"cat_{stamp}.mp4"
+            output = self.output_dir / build_video_filename(
+                text,
+                output_title,
+                generated_at,
+            )
             self._set_status("正在生成胖猫配音…")
             self.tts.generate(text, audio)
             audio_duration = duration_seconds(audio, self.video_maker.ffprobe_path)
@@ -557,7 +564,7 @@ class MainWindow(ctk.CTk):
                 f"基础视频 {result.video_duration:.2f}s，配音 {result.audio_duration:.2f}s，"
                 f"循环 {result.loops} 次，成片 {result.output_duration:.2f}s"
             )
-            self._set_status(f"生成完成：{detail}")
+            self._set_status(f"生成完成｜本次生成文件：{output.name}｜{detail}")
             if publish_fields is not None:
                 self._prepare_publish(output, stamp, publish_fields)
                 return
